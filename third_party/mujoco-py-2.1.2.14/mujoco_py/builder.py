@@ -289,6 +289,14 @@ class LinuxGPUExtensionBuilder(MujocoExtensionBuilder):
 
         self.extension.sources.append(self.CYMJ_DIR_PATH + "/gl/eglshim.c")
         self.extension.include_dirs.append(self.CYMJ_DIR_PATH + '/vendor/egl')
+        import sysconfig
+        conda_prefix = sysconfig.get_path('data')
+        conda_include = join(conda_prefix, 'include')
+        if os.path.isdir(conda_include):
+            self.extension.include_dirs.append(conda_include)
+        sysroot_include = join(conda_prefix, 'x86_64-conda-linux-gnu', 'sysroot', 'usr', 'include')
+        if os.path.isdir(sysroot_include):
+            self.extension.include_dirs.append(sysroot_include)
         self.extension.libraries.extend(['glewegl'])
         self.extension.runtime_library_dirs = [join(mujoco_path, 'bin')]
 

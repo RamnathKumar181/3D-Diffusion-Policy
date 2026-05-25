@@ -1,3 +1,4 @@
+import collections
 import wandb
 import numpy as np
 import torch
@@ -21,6 +22,7 @@ class AdroitRunner(BaseRunner):
                  max_steps=200,
                  n_obs_steps=8,
                  n_action_steps=8,
+                 n_overlap=0,
                  fps=10,
                  crf=22,
                  render_size=84,
@@ -39,7 +41,7 @@ class AdroitRunner(BaseRunner):
                     MujocoPointcloudWrapperAdroit(env=AdroitEnv(env_name=task_name, use_point_cloud=True),
                                                   env_name='adroit_'+task_name, use_point_crop=use_point_crop)),
                 n_obs_steps=n_obs_steps,
-                n_action_steps=n_action_steps,
+                n_action_steps=n_action_steps,  # used by MultiStepWrapper for action space shape
                 max_episode_steps=max_steps,
                 reward_agg_method='sum',
             )
@@ -51,6 +53,7 @@ class AdroitRunner(BaseRunner):
         self.crf = crf
         self.n_obs_steps = n_obs_steps
         self.n_action_steps = n_action_steps
+        self.n_overlap = n_overlap  # re-query this many steps early; execute n_action_steps - n_overlap per cycle
         self.max_steps = max_steps
         self.tqdm_interval_sec = tqdm_interval_sec
 
@@ -77,30 +80,58 @@ class AdroitRunner(BaseRunner):
             done = False
             num_goal_achieved = 0
             actual_step_count = 0
+            n_overlap = self.n_overlap
+            n_execute = self.n_action_steps - n_overlap
+            use_overlap = n_overlap > 0
+
+            # committed: (n_overlap, Da) numpy array of actions already committed for the next
+            # chunk. None until after the first prediction.
+            committed = None
+
             while not done:
-                # create obs dict
+                # -- build obs tensors --
                 np_obs_dict = dict(obs)
-                # device transfer
                 obs_dict = dict_apply(np_obs_dict,
-                                      lambda x: torch.from_numpy(x).to(
-                                          device=device))
+                                      lambda x: torch.from_numpy(x).to(device=device))
+                obs_dict_input = {
+                    'point_cloud': obs_dict['point_cloud'].unsqueeze(0),
+                    'agent_pos':   obs_dict['agent_pos'].unsqueeze(0),
+                }
 
-                # run policy
+                # Pass the committed actions as leftover so the model inpaints them and
+                # predicts everything else fresh: output = [a7, a8, b9, b10, ..., b(T-1)]
+                leftover_tensor = None
+                if use_overlap and committed is not None:
+                    leftover_tensor = torch.from_numpy(committed).to(
+                        device=device, dtype=obs_dict['agent_pos'].dtype).unsqueeze(0)
+
                 with torch.no_grad():
-                    obs_dict_input = {}  # flush unused keys
-                    obs_dict_input['point_cloud'] = obs_dict['point_cloud'].unsqueeze(0)
-                    obs_dict_input['agent_pos'] = obs_dict['agent_pos'].unsqueeze(0)
-                    action_dict = policy.predict_action(obs_dict_input)
-                    
+                    action_dict = policy.predict_action(obs_dict_input, leftover_actions=leftover_tensor)
 
-                # device_transfer
-                np_action_dict = dict_apply(action_dict,
-                                            lambda x: x.detach().to('cpu').numpy())
+                # output shape: (T - action_start, Da)
+                # = [committed(n_overlap), fresh(rest)]
+                output = action_dict['action'].detach().cpu().numpy().squeeze(0)
 
-                action = np_action_dict['action'].squeeze(0)
-                # step env
-                obs, reward, done, info = env.step(action)
-                # all_goal_achieved.append(info['goal_achieved']
+                # n_fresh: how many fresh actions to execute this cycle.
+                # Comes from ChunkSizePredictor when use_dynamic_chunk=True, else fixed n_execute.
+                n_fresh = action_dict.get('n_fresh') or n_execute
+
+                if use_overlap and committed is not None:
+                    # [committed(n_overlap) | fresh(rest)] — execute committed + n_fresh fresh
+                    fresh = output[n_overlap:]
+                    n_fresh = min(n_fresh, len(fresh))
+                    chunk = np.concatenate([committed, fresh[:n_fresh]], axis=0)
+                    # next committed = the n_overlap actions immediately after this chunk
+                    committed = fresh[n_fresh:n_fresh + n_overlap]
+                elif use_overlap:
+                    # First cycle: execute n_fresh; carry next n_overlap as committed
+                    n_fresh = min(n_fresh, len(output) - n_overlap)
+                    chunk = output[:n_fresh]
+                    committed = output[n_fresh:n_fresh + n_overlap]
+                else:
+                    chunk = output[:n_fresh]
+
+                obs, reward, done, info = env.step(chunk)
                 num_goal_achieved += np.sum(info['goal_achieved'])
                 done = np.all(done)
                 actual_step_count += 1

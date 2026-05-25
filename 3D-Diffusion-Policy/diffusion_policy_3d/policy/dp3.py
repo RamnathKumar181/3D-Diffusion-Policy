@@ -18,13 +18,66 @@ from diffusion_policy_3d.common.pytorch_util import dict_apply
 from diffusion_policy_3d.common.model_util import print_params
 from diffusion_policy_3d.model.vision.pointnet_extractor import DP3Encoder
 
+
+class ChunkSizePredictor(nn.Module):
+    """
+    Predicts a categorical distribution over total chunk sizes to execute per cycle.
+
+    chunk_size ∈ [min_chunk, max_chunk] where:
+        min_chunk = n_action_steps   (baseline — never execute fewer than the standard chunk)
+        max_chunk = horizon          (greedy — commit the whole predicted horizon at once)
+
+    Input : mean-pooled action predictions  (B, Da)
+            + flattened observation features (B, D_obs)
+    Output: logits (B, n_options)
+
+    Training: entropy regularisation keeps the distribution non-degenerate during
+    imitation learning; fine-tune later with an RL reward to specialise.
+    """
+
+    def __init__(self, action_dim: int, obs_feature_dim: int,
+                 min_chunk: int, max_chunk: int, hidden_dim: int = 128):
+        super().__init__()
+        assert max_chunk >= min_chunk >= 1
+        self.min_chunk = min_chunk
+        self.max_chunk = max_chunk
+        self.n_options = max_chunk - min_chunk + 1
+        self.net = nn.Sequential(
+            nn.Linear(action_dim + obs_feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, self.n_options),
+        )
+
+    def forward(self, action_seq: torch.Tensor, obs_feat: torch.Tensor) -> torch.Tensor:
+        """
+        action_seq : (B, T, Da)  – full predicted action output (committed + fresh)
+        obs_feat   : (B, D_obs)  – flattened global observation features
+        returns logits (B, n_options)
+        """
+        x = torch.cat([action_seq.mean(dim=1), obs_feat], dim=-1)
+        return self.net(x)
+
+    def get_chunk_size(self, action_seq: torch.Tensor, obs_feat: torch.Tensor,
+                       deterministic: bool = False) -> torch.Tensor:
+        """Sample from (or argmax) the distribution; returns (B,) int tensor of total chunk sizes."""
+        logits = self.forward(action_seq, obs_feat)
+        if deterministic:
+            indices = logits.argmax(dim=-1)
+        else:
+            indices = torch.distributions.Categorical(logits=logits).sample()
+        return self.min_chunk + indices  # (B,)
+
+
 class DP3(BasePolicy):
     def __init__(self, 
             shape_meta: dict,
             noise_scheduler: DDPMScheduler,
             horizon, 
-            n_action_steps, 
+            n_action_steps,
             n_obs_steps,
+            n_overlap=0,
             num_inference_steps=None,
             obs_as_global_cond=True,
             diffusion_step_embed_dim=256,
@@ -40,6 +93,10 @@ class DP3(BasePolicy):
             use_pc_color=False,
             pointnet_type="pointnet",
             pointcloud_encoder_cfg=None,
+            # dynamic chunking
+            use_dynamic_chunk=False,
+            chunk_hidden_dim=128,
+            chunk_loss_weight=0.1,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -121,6 +178,7 @@ class DP3(BasePolicy):
         self.action_dim = action_dim
         self.n_action_steps = n_action_steps
         self.n_obs_steps = n_obs_steps
+        self.n_overlap = n_overlap
         self.obs_as_global_cond = obs_as_global_cond
         self.kwargs = kwargs
 
@@ -128,6 +186,30 @@ class DP3(BasePolicy):
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
 
+        # --- dynamic chunk predictor (optional) ---
+        self.use_dynamic_chunk = use_dynamic_chunk
+        self.chunk_loss_weight = chunk_loss_weight
+        self.chunk_predictor = None
+        if use_dynamic_chunk:
+            assert obs_as_global_cond, "use_dynamic_chunk requires obs_as_global_cond=True"
+            # Total chunk size: at least n_action_steps (baseline), at most the full
+            # available action window (horizon - action_start positions).
+            action_start = n_obs_steps - 1
+            min_chunk = n_action_steps
+            max_chunk = horizon - action_start   # all slots the model predicts
+            assert max_chunk >= min_chunk, (
+                f"horizon ({horizon}) - action_start ({action_start}) = {max_chunk} "
+                f"< n_action_steps ({n_action_steps})"
+            )
+            obs_feat_dim = obs_feature_dim * n_obs_steps  # flat global_cond size
+            self.chunk_predictor = ChunkSizePredictor(
+                action_dim=action_dim,
+                obs_feature_dim=obs_feat_dim,
+                min_chunk=min_chunk,
+                max_chunk=max_chunk,
+                hidden_dim=chunk_hidden_dim,
+            )
+            cprint(f"[DP3] ChunkSizePredictor: chunk_size ∈ [{min_chunk}, {max_chunk}]", "cyan")
 
         print_params(self)
         
@@ -174,9 +256,11 @@ class DP3(BasePolicy):
         return trajectory
 
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor], leftover_actions=None) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
+        leftover_actions: optional (B, k, Da) tensor of already-committed actions to condition on.
+            The model treats these as fixed and predicts n_action_steps new actions after them.
         result: must include "action" key
         """
         # normalize input
@@ -225,31 +309,47 @@ class DP3(BasePolicy):
             cond_data[:,:To,Da:] = nobs_features
             cond_mask[:,:To,Da:] = True
 
+        # Inpaint only the n_overlap committed actions from the leftover.
+        # The committed prefix (a7,a8 in the example) stays fixed; everything
+        # after is predicted fresh, giving [a7, a8, b9, b10, ...] in the output.
+        action_start = To - 1  # position in horizon where actions begin
+        n_committed = 0
+        if leftover_actions is not None and self.n_overlap > 0:
+            n_committed = min(self.n_overlap, leftover_actions.shape[1])
+            assert action_start + n_committed < T, \
+                f"horizon {T} too small for n_obs_steps-1={action_start} + n_overlap={n_committed}"
+            nleftover = self.normalizer['action'].normalize(leftover_actions[:, :n_committed])
+            cond_data[:, action_start:action_start + n_committed, :Da] = nleftover
+            cond_mask[:, action_start:action_start + n_committed, :Da] = True
+
         # run sampling
         nsample = self.conditional_sample(
-            cond_data, 
+            cond_data,
             cond_mask,
             local_cond=local_cond,
             global_cond=global_cond,
             **self.kwargs)
-        
+
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
 
-        # get action
-        start = To - 1
-        end = start + self.n_action_steps
-        action = action_pred[:,start:end]
-        
-        # get prediction
-
+        # Return the full horizon from action_start: [committed(n_overlap), fresh(rest)].
+        # Layout: [a7, a8, b9, b10, ..., b(horizon-1)]
+        action = action_pred[:, action_start:]
 
         result = {
             'action': action,
             'action_pred': action_pred,
+            'n_fresh': None,
         }
-        
+
+        if self.use_dynamic_chunk and self.chunk_predictor is not None:
+            obs_feat = global_cond.reshape(B, -1)
+            # chunk_sizes: (B,) tensor; use element [0] — B=1 at inference, arbitrary at training sample
+            chunk_sizes = self.chunk_predictor.get_chunk_size(action, obs_feat)
+            result['n_fresh'] = max(int(chunk_sizes[0].item()) - n_committed, 1)
+
         return result
 
     # ========= training  ============
@@ -303,6 +403,13 @@ class DP3(BasePolicy):
 
         # generate impainting mask
         condition_mask = self.mask_generator(trajectory.shape)
+
+        # Randomly inpaint the committed n_overlap prefix so the model learns to condition on it.
+        if self.n_overlap > 0:
+            action_start = self.n_obs_steps - 1
+            k = torch.randint(0, self.n_overlap + 1, (1,)).item()
+            if k > 0:
+                condition_mask[:, action_start:action_start + k, :self.action_dim] = True
 
         # Sample noise that we'll add to the images
         noise = torch.randn(trajectory.shape, device=trajectory.device)
@@ -360,17 +467,39 @@ class DP3(BasePolicy):
         loss = loss * loss_mask.type(loss.dtype)
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
-        
 
-        loss_dict = {
-                'bc_loss': loss.item(),
-            }
+        loss_dict = {'bc_loss': loss.item()}
 
-        # print(f"t2-t1: {t2-t1:.3f}")
-        # print(f"t3-t2: {t3-t2:.3f}")
-        # print(f"t4-t3: {t4-t3:.3f}")
-        # print(f"t5-t4: {t5-t4:.3f}")
-        # print(f"t6-t5: {t6-t5:.3f}")
-        
+        if self.use_dynamic_chunk and self.chunk_predictor is not None:
+            action_start = self.n_obs_steps - 1
+            action_seq_gt = nactions[:, action_start:, :self.action_dim]  # (B, T_out, Da)
+            # Detach obs features so the chunk loss doesn't backprop through the obs encoder.
+            # The obs encoder already receives strong gradients from the diffusion loss;
+            # routing chunk gradients through it too would fragment its features and cause OOM.
+            obs_feat = global_cond.detach().reshape(batch_size, -1)
+            chunk_logits = self.chunk_predictor(action_seq_gt, obs_feat)
+
+            # --- supervised chunk size label from action smoothness ---
+            # Step-to-step velocity over the full predicted window.
+            # High velocity (rapid direction changes) → re-query sooner → small chunk.
+            # Low velocity (smooth trajectory)         → commit further → large chunk.
+            with torch.no_grad():
+                vel = (action_seq_gt[:, 1:] - action_seq_gt[:, :-1]).norm(dim=-1)  # (B, T_out-1)
+                mean_vel = vel.mean(dim=-1)  # (B,)
+
+                # Rank within the batch: lowest velocity → largest chunk index.
+                # argsort twice gives the rank of each element (0 = smallest).
+                ranks = mean_vel.argsort().argsort().float()           # (B,) in [0, B-1]
+                # Map rank linearly to option index [0, n_options-1].
+                # Rank 0 (smoothest) → index n_options-1 (largest chunk).
+                # Rank B-1 (jerkiest) → index 0 (smallest chunk).
+                n_opt = self.chunk_predictor.n_options
+                chunk_label = ((1.0 - ranks / (batch_size - 1 + 1e-6)) * (n_opt - 1)).long()
+                chunk_label = chunk_label.clamp(0, n_opt - 1)
+
+            chunk_loss = F.cross_entropy(chunk_logits, chunk_label)
+            loss = loss + self.chunk_loss_weight * chunk_loss
+            loss_dict['chunk_loss'] = chunk_loss.item()
+
         return loss, loss_dict
 

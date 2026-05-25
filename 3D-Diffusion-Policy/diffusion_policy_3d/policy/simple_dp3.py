@@ -23,8 +23,9 @@ class SimpleDP3(BasePolicy):
             shape_meta: dict,
             noise_scheduler: DDPMScheduler,
             horizon, 
-            n_action_steps, 
+            n_action_steps,
             n_obs_steps,
+            n_overlap=0,
             num_inference_steps=None,
             obs_as_global_cond=True,
             diffusion_step_embed_dim=256,
@@ -120,6 +121,7 @@ class SimpleDP3(BasePolicy):
         self.action_dim = action_dim
         self.n_action_steps = n_action_steps
         self.n_obs_steps = n_obs_steps
+        self.n_overlap = n_overlap
         self.obs_as_global_cond = obs_as_global_cond
         self.kwargs = kwargs
 
@@ -173,9 +175,11 @@ class SimpleDP3(BasePolicy):
         return trajectory
 
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor], leftover_actions=None) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
+        leftover_actions: optional (B, k, Da) tensor of already-committed actions to condition on.
+            The model treats these as fixed and predicts n_action_steps new actions after them.
         result: must include "action" key
         """
         # normalize input
@@ -224,22 +228,31 @@ class SimpleDP3(BasePolicy):
             cond_data[:,:To,Da:] = nobs_features
             cond_mask[:,:To,Da:] = True
 
+        # Inpaint only the n_overlap committed actions; predict everything else fresh.
+        action_start = To - 1  # position in horizon where actions begin
+        n_committed = 0
+        if leftover_actions is not None and self.n_overlap > 0:
+            n_committed = min(self.n_overlap, leftover_actions.shape[1])
+            assert action_start + n_committed < T, \
+                f"horizon {T} too small for n_obs_steps-1={action_start} + n_overlap={n_committed}"
+            nleftover = self.normalizer['action'].normalize(leftover_actions[:, :n_committed])
+            cond_data[:, action_start:action_start + n_committed, :Da] = nleftover
+            cond_mask[:, action_start:action_start + n_committed, :Da] = True
+
         # run sampling
         nsample = self.conditional_sample(
-            cond_data, 
+            cond_data,
             cond_mask,
             local_cond=local_cond,
             global_cond=global_cond,
             **self.kwargs)
-        
+
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
 
-        # get action
-        start = To - 1
-        end = start + self.n_action_steps
-        action = action_pred[:,start:end]
+        # Return full output: [committed(n_overlap), fresh(rest)]
+        action = action_pred[:, action_start:]
         
         # get prediction
 
@@ -302,6 +315,13 @@ class SimpleDP3(BasePolicy):
 
         # generate impainting mask
         condition_mask = self.mask_generator(trajectory.shape)
+
+        # Randomly inpaint the committed n_overlap prefix so the model learns to condition on it.
+        if self.n_overlap > 0:
+            action_start = self.n_obs_steps - 1
+            k = torch.randint(0, self.n_overlap + 1, (1,)).item()
+            if k > 0:
+                condition_mask[:, action_start:action_start + k, :self.action_dim] = True
 
         # Sample noise that we'll add to the images
         noise = torch.randn(trajectory.shape, device=trajectory.device)

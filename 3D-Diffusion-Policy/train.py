@@ -68,6 +68,9 @@ class TrainDP3Workspace:
         self.global_step = 0
         self.epoch = 0
 
+        use_amp = cfg.training.get('use_amp', False)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
     def run(self):
         cfg = copy.deepcopy(self.cfg)
         
@@ -192,15 +195,19 @@ class TrainDP3Workspace:
                 
                     # compute loss
                     t1_1 = time.time()
-                    raw_loss, loss_dict = self.model.compute_loss(batch)
+                    use_amp = cfg.training.get('use_amp', False)
+                    with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
+                        raw_loss, loss_dict = self.model.compute_loss(batch)
                     loss = raw_loss / cfg.training.gradient_accumulate_every
-                    loss.backward()
-                    
+                    self.scaler.scale(loss).backward()
+
                     t1_2 = time.time()
 
                     # step optimizer
                     if self.global_step % cfg.training.gradient_accumulate_every == 0:
-                        self.optimizer.step()
+                        self.scaler.unscale_(self.optimizer)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
                         self.optimizer.zero_grad()
                         lr_scheduler.step()
                     t1_3 = time.time()
@@ -339,9 +346,13 @@ class TrainDP3Workspace:
         cfg = copy.deepcopy(self.cfg)
         
         lastest_ckpt_path = self.get_checkpoint_path(tag="latest")
-        if lastest_ckpt_path.is_file():
-            cprint(f"Resuming from checkpoint {lastest_ckpt_path}", 'magenta')
-            self.load_checkpoint(path=lastest_ckpt_path)
+        if not lastest_ckpt_path.is_file():
+            raise FileNotFoundError(
+                f"No checkpoint found at {lastest_ckpt_path}. "
+                "Make sure the run_dir and seed match your training run."
+            )
+        cprint(f"Resuming from checkpoint {lastest_ckpt_path}", 'magenta')
+        self.load_checkpoint(path=lastest_ckpt_path)
         
         # configure env
         env_runner: BaseRunner
